@@ -2,29 +2,22 @@
 
 Covers:
   - write_frequency parsing (async / turn / session / int)
-  - memory_mode parsing
   - resolve_session_name with session_title
   - HonchoSessionManager.save() routing per write_frequency
   - async writer thread lifecycle and retry
   - flush_all() drains pending messages
   - shutdown() joins the thread
-  - memory_mode gating helpers (unit-level)
 """
 
 import json
-import queue
-import threading
 import time
-from pathlib import Path
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 from plugins.memory.honcho.client import HonchoClientConfig
 from plugins.memory.honcho.session import (
     HonchoSession,
     HonchoSessionManager,
-    _ASYNC_SHUTDOWN,
 )
 
 
@@ -42,10 +35,9 @@ def _make_session(**kwargs) -> HonchoSession:
     )
 
 
-def _make_manager(write_frequency="turn", memory_mode="hybrid") -> HonchoSessionManager:
+def _make_manager(write_frequency="turn") -> HonchoSessionManager:
     cfg = HonchoClientConfig(
         write_frequency=write_frequency,
-        memory_mode=memory_mode,
         api_key="test-key",
         enabled=True,
     )
@@ -104,77 +96,6 @@ class TestWriteFrequencyParsing:
         cfg_file.write_text(json.dumps({"apiKey": "k"}))
         cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
         assert cfg.write_frequency == "async"
-
-
-# ---------------------------------------------------------------------------
-# memory_mode parsing from config file
-# ---------------------------------------------------------------------------
-
-class TestMemoryModeParsing:
-    def test_hybrid(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"apiKey": "k", "memoryMode": "hybrid"}))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "hybrid"
-
-    def test_honcho_only(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"apiKey": "k", "memoryMode": "honcho"}))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "honcho"
-
-    def test_defaults_to_hybrid(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({"apiKey": "k"}))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "hybrid"
-
-    def test_host_block_overrides_root(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({
-            "apiKey": "k",
-            "memoryMode": "hybrid",
-            "hosts": {"hermes": {"memoryMode": "honcho"}},
-        }))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "honcho"
-
-    def test_object_form_sets_default_and_overrides(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({
-            "apiKey": "k",
-            "hosts": {"hermes": {"memoryMode": {
-                "default": "hybrid",
-                "hermes": "honcho",
-            }}},
-        }))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "hybrid"
-        assert cfg.peer_memory_mode("hermes") == "honcho"
-        assert cfg.peer_memory_mode("unknown") == "hybrid"  # falls through to default
-
-    def test_object_form_no_default_falls_back_to_hybrid(self, tmp_path):
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({
-            "apiKey": "k",
-            "hosts": {"hermes": {"memoryMode": {"hermes": "honcho"}}},
-        }))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "hybrid"
-        assert cfg.peer_memory_mode("hermes") == "honcho"
-        assert cfg.peer_memory_mode("other") == "hybrid"
-
-    def test_global_string_host_object_override(self, tmp_path):
-        """Host object form overrides global string."""
-        cfg_file = tmp_path / "config.json"
-        cfg_file.write_text(json.dumps({
-            "apiKey": "k",
-            "memoryMode": "honcho",
-            "hosts": {"hermes": {"memoryMode": {"default": "hybrid", "hermes": "honcho"}}},
-        }))
-        cfg = HonchoClientConfig.from_global_config(config_path=cfg_file)
-        assert cfg.memory_mode == "hybrid"  # host default wins over global "honcho"
-        assert cfg.peer_memory_mode("hermes") == "honcho"
 
 
 # ---------------------------------------------------------------------------
@@ -328,9 +249,12 @@ class TestFlushAll:
         mgr = _make_manager(write_frequency="async")
         sess = _make_session()
         sess.add_message("user", "pending")
-        mgr._async_queue.put(sess)
 
         with patch.object(mgr, "_flush_session") as mock_flush:
+            # Put the item AFTER the mock is installed so the background
+            # writer thread (if it dequeues before flush_all) still hits
+            # the mock rather than the real _flush_session.
+            mgr._async_queue.put(sess)
             mgr.flush_all()
             # Called at least once for the queued item
             assert mock_flush.call_count >= 1
@@ -519,26 +443,9 @@ class TestNewConfigFieldDefaults:
         cfg = HonchoClientConfig()
         assert cfg.write_frequency == "async"
 
-    def test_memory_mode_default(self):
-        cfg = HonchoClientConfig()
-        assert cfg.memory_mode == "hybrid"
-
     def test_write_frequency_set(self):
         cfg = HonchoClientConfig(write_frequency="turn")
         assert cfg.write_frequency == "turn"
-
-    def test_memory_mode_set(self):
-        cfg = HonchoClientConfig(memory_mode="honcho")
-        assert cfg.memory_mode == "honcho"
-
-    def test_peer_memory_mode_falls_back_to_global(self):
-        cfg = HonchoClientConfig(memory_mode="honcho")
-        assert cfg.peer_memory_mode("any-peer") == "honcho"
-
-    def test_peer_memory_mode_override(self):
-        cfg = HonchoClientConfig(memory_mode="hybrid", peer_memory_modes={"hermes": "honcho"})
-        assert cfg.peer_memory_mode("hermes") == "honcho"
-        assert cfg.peer_memory_mode("other") == "hybrid"
 
 
 class TestPrefetchCacheAccessors:
@@ -551,10 +458,3 @@ class TestPrefetchCacheAccessors:
         assert mgr.pop_context_result("cli:test") == payload
         assert mgr.pop_context_result("cli:test") == {}
 
-    def test_set_and_pop_dialectic_result(self):
-        mgr = _make_manager(write_frequency="turn")
-
-        mgr.set_dialectic_result("cli:test", "Resume with toolset cleanup")
-
-        assert mgr.pop_dialectic_result("cli:test") == "Resume with toolset cleanup"
-        assert mgr.pop_dialectic_result("cli:test") == ""

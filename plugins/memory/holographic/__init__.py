@@ -8,7 +8,7 @@ Original plugin by dusterbloom (PR #2351), adapted to the MemoryProvider ABC.
 Config in $HERMES_HOME/config.yaml (profile-scoped):
   plugins:
     hermes-memory-store:
-      db_path: $HERMES_HOME/memory_store.db
+      db_path: $HERMES_HOME/memory_store.db   # omit to use the default
       auto_extract: false
       default_trust: 0.5
       min_trust_threshold: 0.3
@@ -20,12 +20,13 @@ from __future__ import annotations
 import json
 import logging
 import re
-from pathlib import Path
 from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
+from tools.registry import tool_error
 from .store import MemoryStore
 from .retrieval import FactRetriever
+from hermes_cli.config import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +101,9 @@ def _load_plugin_config() -> dict:
         return {}
     try:
         import yaml
-        with open(config_path) as f:
+        with open(config_path, encoding="utf-8-sig") as f:
             all_config = yaml.safe_load(f) or {}
-        return all_config.get("plugins", {}).get("hermes-memory-store", {}) or {}
+        return cfg_get(all_config, "plugins", "hermes-memory-store", default={}) or {}
     except Exception:
         return {}
 
@@ -135,11 +136,11 @@ class HolographicMemoryProvider(MemoryProvider):
             import yaml
             existing = {}
             if config_path.exists():
-                with open(config_path) as f:
+                with open(config_path, encoding="utf-8-sig") as f:
                     existing = yaml.safe_load(f) or {}
             existing.setdefault("plugins", {})
             existing["plugins"]["hermes-memory-store"] = values
-            with open(config_path, "w") as f:
+            with open(config_path, "w", encoding="utf-8") as f:
                 yaml.dump(existing, f, default_flow_style=False)
         except Exception:
             pass
@@ -156,8 +157,15 @@ class HolographicMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         from hermes_constants import get_hermes_home
-        _default_db = str(get_hermes_home() / "memory_store.db")
+        _hermes_home = str(get_hermes_home())
+        _default_db = _hermes_home + "/memory_store.db"
         db_path = self._config.get("db_path", _default_db)
+        # Expand $HERMES_HOME in user-supplied paths so config values like
+        # "$HERMES_HOME/memory_store.db" or "~/.hermes/memory_store.db" both
+        # resolve to the active profile's directory.
+        if isinstance(db_path, str):
+            db_path = db_path.replace("$HERMES_HOME", _hermes_home)
+            db_path = db_path.replace("${HERMES_HOME}", _hermes_home)
         default_trust = float(self._config.get("default_trust", 0.5))
         hrr_dim = int(self._config.get("hrr_dim", 1024))
         hrr_weight = float(self._config.get("hrr_weight", 0.3))
@@ -182,7 +190,12 @@ class HolographicMemoryProvider(MemoryProvider):
         except Exception:
             total = 0
         if total == 0:
-            return ""
+            return (
+                "# Holographic Memory\n"
+                "Active. Empty fact store — proactively add facts the user would expect you to remember.\n"
+                "Use fact_store(action='add') to store durable structured facts about people, projects, preferences, decisions.\n"
+                "Use fact_feedback to rate facts after using them (trains trust scores)."
+            )
         return (
             f"# Holographic Memory\n"
             f"Active. {total} facts stored with entity resolution and trust scoring.\n"
@@ -199,7 +212,7 @@ class HolographicMemoryProvider(MemoryProvider):
                 return ""
             lines = []
             for r in results:
-                trust = r.get("trust", 0)
+                trust = r.get("trust_score", r.get("trust", 0))
                 lines.append(f"- [{trust:.1f}] {r.get('content', '')}")
             return "## Holographic Memory\n" + "\n".join(lines)
         except Exception as e:
@@ -219,7 +232,7 @@ class HolographicMemoryProvider(MemoryProvider):
             return self._handle_fact_store(args)
         elif tool_name == "fact_feedback":
             return self._handle_fact_feedback(args)
-        return json.dumps({"error": f"Unknown tool: {tool_name}"})
+        return tool_error(f"Unknown tool: {tool_name}")
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         if not self._config.get("auto_extract", False):
@@ -285,7 +298,7 @@ class HolographicMemoryProvider(MemoryProvider):
             elif action == "reason":
                 entities = args.get("entities", [])
                 if not entities:
-                    return json.dumps({"error": "reason requires 'entities' list"})
+                    return tool_error("reason requires 'entities' list")
                 results = retriever.reason(
                     entities,
                     category=args.get("category"),
@@ -323,12 +336,12 @@ class HolographicMemoryProvider(MemoryProvider):
                 return json.dumps({"facts": facts, "count": len(facts)})
 
             else:
-                return json.dumps({"error": f"Unknown action: {action}"})
+                return tool_error(f"Unknown action: {action}")
 
         except KeyError as exc:
-            return json.dumps({"error": f"Missing required argument: {exc}"})
+            return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return tool_error(str(exc))
 
     def _handle_fact_feedback(self, args: dict) -> str:
         try:
@@ -337,9 +350,9 @@ class HolographicMemoryProvider(MemoryProvider):
             result = self._store.record_feedback(fact_id, helpful=helpful)
             return json.dumps(result)
         except KeyError as exc:
-            return json.dumps({"error": f"Missing required argument: {exc}"})
+            return tool_error(f"Missing required argument: {exc}")
         except Exception as exc:
-            return json.dumps({"error": str(exc)})
+            return tool_error(str(exc))
 
     # -- Auto-extraction (on_session_end) ------------------------------------
 
